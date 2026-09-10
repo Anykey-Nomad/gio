@@ -1139,6 +1139,72 @@ func sign(n int) int {
 	}
 }
 
+// ---- Custom methods for WASM template editor ----
+
+// Focused reports whether the editor has keyboard focus.
+func (e *Editor) Focused(gtx layout.Context) bool {
+	return gtx.Focused(e)
+}
+
+// SelectionRange returns the selection as (from, to) with from <= to.
+// If there is no selection, from == to == caret position.
+func (e *Editor) SelectionRange() (from, to int) {
+	e.initBuffer()
+	start, end := e.text.Selection()
+	if start <= end {
+		return start, end
+	}
+	return end, start
+}
+
+// HasSelection reports whether any text is selected.
+func (e *Editor) HasSelection() bool {
+	from, to := e.SelectionRange()
+	return from != to
+}
+
+// ReplaceSelection replaces the currently selected text with s and returns
+// the number of runes inserted. If nothing is selected, it inserts at the caret.
+func (e *Editor) ReplaceSelection(s string) int {
+	e.initBuffer()
+	return e.Insert(s)
+}
+
+// SelectRange selects runes [start, end) inclusive.
+func (e *Editor) SelectRange(start, end int) {
+	e.initBuffer()
+	length := e.text.Len()
+	if start < 0 {
+		start = 0
+	}
+	if end > length {
+		end = length
+	}
+	if start > end {
+		start, end = end, start
+	}
+	e.text.SetCaret(start, end)
+}
+
+// SelectAll selects the entire text content.
+func (e *Editor) SelectAll() {
+	e.initBuffer()
+	e.text.SetCaret(0, e.text.Len())
+}
+
+// CaretOffset returns the caret position as a rune offset.
+// If there is a selection, returns the start of the selection.
+func (e *Editor) CaretOffset() int {
+	e.initBuffer()
+	start, _ := e.text.Selection()
+	return start
+}
+
+// LenRunes returns the text length in runes (same as Len(), but with clearer name).
+func (e *Editor) LenRunes() int {
+	return e.Len()
+}
+
 func (s ChangeEvent) isEditorEvent() {}
 func (s SubmitEvent) isEditorEvent() {}
 func (s SelectEvent) isEditorEvent() {}
