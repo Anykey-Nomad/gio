@@ -14,7 +14,6 @@ import (
 	"image"
 	"image/color"
 	"math"
-	"reflect"
 	"slices"
 	"time"
 	"unsafe"
@@ -347,26 +346,19 @@ func NewWithDevice(d driver.Device) (GPU, error) {
 	feats := d.Caps().Features
 	switch {
 	case feats.Has(driver.FeatureFloatRenderTargets) && feats.Has(driver.FeatureSRGB):
-		return newGPU(d)
+		return newGPU(d), nil
 	}
 	return nil, errors.New("no available GPU driver")
 }
 
-func newGPU(ctx driver.Device) (*gpu, error) {
+func newGPU(ctx driver.Device) *gpu {
 	g := &gpu{
 		cache: newTextureCache(),
 	}
-	g.drawOps.pathCache = newOpCache()
-	if err := g.init(ctx); err != nil {
-		return nil, err
-	}
-	return g, nil
-}
-
-func (g *gpu) init(ctx driver.Device) error {
 	g.ctx = ctx
+	g.drawOps.pathCache = newOpCache()
 	g.renderer = newRenderer(ctx)
-	return nil
+	return g
 }
 
 func (g *gpu) Clear(col color.NRGBA) {
@@ -548,7 +540,11 @@ func newBlitter(ctx driver.Device) *blitter {
 	b.texUniforms = new(blitTexUniforms)
 	b.linearGradientUniforms = new(blitLinearGradientUniforms)
 	pipelines, err := createColorPrograms(ctx, gio.Shader_blit_vert, gio.Shader_blit_frag,
-		[3]any{b.colUniforms, b.linearGradientUniforms, b.texUniforms},
+		[...][]byte{
+			byteslice.View(b.colUniforms),
+			byteslice.View(b.linearGradientUniforms),
+			byteslice.View(b.texUniforms),
+		},
 	)
 	if err != nil {
 		panic(err)
@@ -566,7 +562,7 @@ func (b *blitter) release() {
 	}
 }
 
-func createColorPrograms(b driver.Device, vsSrc shader.Sources, fsSrc [3]shader.Sources, uniforms [3]any) (pipelines [2][3]*pipeline, err error) {
+func createColorPrograms(b driver.Device, vsSrc shader.Sources, fsSrc [3]shader.Sources, uniforms [3][]byte) (pipelines [2][3]*pipeline, err error) {
 	defer func() {
 		if err != nil {
 			for _, p := range pipelines {
@@ -1320,17 +1316,12 @@ func (b *blitter) blit(mat materialType, fbo bool, col f32color.RGBA, col1, col2
 
 // newUniformBuffer creates a new GPU uniform buffer backed by the
 // structure uniformBlock points to.
-func newUniformBuffer(b driver.Device, uniformBlock any) *uniformBuffer {
-	ref := reflect.ValueOf(uniformBlock)
-	// Determine the size of the uniforms structure, *uniforms.
-	size := ref.Elem().Type().Size()
-	// Map the uniforms structure as a byte slice.
-	ptr := unsafe.Slice((*byte)(unsafe.Pointer(ref.Pointer())), size)
-	ubuf, err := b.NewBuffer(driver.BufferBindingUniforms, len(ptr))
+func newUniformBuffer(b driver.Device, uniforms []byte) *uniformBuffer {
+	ubuf, err := b.NewBuffer(driver.BufferBindingUniforms, len(uniforms))
 	if err != nil {
 		panic(err)
 	}
-	return &uniformBuffer{buf: ubuf, ptr: ptr}
+	return &uniformBuffer{buf: ubuf, ptr: uniforms}
 }
 
 func (u *uniformBuffer) Upload() {

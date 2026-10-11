@@ -154,7 +154,7 @@ func (x *Context) Modifiers() key.Modifiers {
 	return mods
 }
 
-func (x *Context) DispatchKey(keyCode uint32, state key.State) (events []event.Event) {
+func (x *Context) DispatchKey(keyCode uint32, state key.State) (symbol uint32, events []event.Event) {
 	if x.state == nil {
 		return
 	}
@@ -163,6 +163,7 @@ func (x *Context) DispatchKey(keyCode uint32, state key.State) (events []event.E
 		x.utf8Buf = make([]byte, 1)
 	}
 	sym := C.xkb_state_key_get_one_sym(x.state, kc)
+	symbol = uint32(sym)
 	if name, ok := convertKeysym(sym); ok {
 		cmd := key.Event{
 			Name:      name,
@@ -175,6 +176,13 @@ func (x *Context) DispatchKey(keyCode uint32, state key.State) (events []event.E
 			cmd.Modifiers |= key.ModShift
 		}
 		events = append(events, cmd)
+	}
+	// Only advance the compose state machine on key PRESS. Feeding it on
+	// RELEASE resolves a pending dead key into its raw glyph (e.g. '~')
+	// and leaks it as a spurious EditEvent. xkbcommon documents that the
+	// keysym to feed is "usually obtained after a key-press event".
+	if state != key.Press {
+		return
 	}
 	C.xkb_compose_state_feed(x.compState, sym)
 	var str []byte

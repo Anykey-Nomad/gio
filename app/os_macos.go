@@ -547,7 +547,7 @@ func (w *window) SetCursor(cursor pointer.Cursor) {
 }
 
 func (w *window) EditorStateChanged(old, new editorState) {
-	if old.Selection.Range != new.Selection.Range || !areSnippetsConsistent(old.Snippet, new.Snippet) {
+	if shouldCancelComposition(old, new) {
 		C.discardMarkedText(w.view)
 		w.w.SetComposingRegion(key.Range{Start: -1, End: -1})
 	}
@@ -999,6 +999,17 @@ func gio_onDestroy(h C.uintptr_t) {
 	w.displayLink = nil
 	cgo.Handle(h).Delete()
 	w.view = 0
+}
+
+//export gio_onCloseRequest
+func gio_onCloseRequest(h C.uintptr_t) C.int {
+	w := windowFor(h)
+	e := &ClosingEvent{}
+	w.ProcessEvent(e)
+	if e.abort {
+		return 0
+	}
+	return 1
 }
 
 //export gio_onFinishLaunching

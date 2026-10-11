@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"image"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -95,7 +96,12 @@ func newWindow(win *callbacks, options []Option) {
 		// then thread-specific messages such as WM_QUIT are ignored.
 		// Instead lock the thread so window messages arrive through
 		// unfiltered GetMessage calls.
+		//
+		// Don't call UnLockOSThread, so that the Go runtime doesn't
+		// reuse a thread with thread-specific settings such as DPI
+		// awareness.
 		runtime.LockOSThread()
+		windows.SetThreadDpiAwarenessContext()
 
 		w := &window{
 			w: win,
@@ -124,7 +130,6 @@ func newWindow(win *callbacks, options []Option) {
 
 // initResources initializes the resources global.
 func initResources() error {
-	windows.SetProcessDPIAware()
 	hInst, err := windows.GetModuleHandle()
 	if err != nil {
 		return err
@@ -135,7 +140,19 @@ func initResources() error {
 		return err
 	}
 	resources.cursor = c
-	icon, _ := windows.LoadImage(hInst, iconID, windows.IMAGE_ICON, 0, 0, windows.LR_DEFAULTSIZE|windows.LR_SHARED)
+	// Prefer an icon supplied at IDI_APPLICATION, which is where a
+	// resource author puts an icon meant for the window and title bar.
+	// Fall back to the first icon group for resources built without
+	// one, which is the previous behavior. A binary with no icon
+	// resources at all keeps an icon-less window class, as before.
+	var icon syscall.Handle
+	for _, id := range []uint32{windows.IDI_APPLICATION, iconID} {
+		h, err := windows.LoadImage(hInst, id, windows.IMAGE_ICON, 0, 0, windows.LR_DEFAULTSIZE|windows.LR_SHARED)
+		if err == nil {
+			icon = h
+			break
+		}
+	}
 
 	appid, err := syscall.UTF16PtrFromString(ID)
 	if err != nil {
@@ -256,8 +273,18 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 		// The message is processed.
 		return windows.TRUE
 	case windows.WM_DPICHANGED:
-		// Let Windows know we're prepared for runtime DPI changes.
-		return windows.TRUE
+		// Windows provides a rectangle scaled for the new monitor DPI.
+		r := (*windows.Rect)(unsafe.Pointer(lParam))
+		windows.SetWindowPos(
+			w.hwnd,
+			0,
+			r.Left,
+			r.Top,
+			r.Right-r.Left,
+			r.Bottom-r.Top,
+			windows.SWP_NOACTIVATE|windows.SWP_NOZORDER,
+		)
+		return 0
 	case windows.WM_ERASEBKGND:
 		// Avoid flickering between GPU content and background color.
 		return windows.TRUE
@@ -325,6 +352,12 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 		np := windows.Point{X: int32(x), Y: int32(y)}
 		windows.ScreenToClient(w.hwnd, &np)
 		return w.hitTest(int(np.X), int(np.Y))
+	case windows.WM_CLOSE:
+		e := &ClosingEvent{}
+		w.ProcessEvent(e)
+		if e.abort {
+			return 0
+		}
 	case windows.WM_POINTERWHEEL:
 		w.scrollEvent(wParam, lParam, false, getModifiers())
 	case windows.WM_POINTERHWHEEL:
@@ -360,7 +393,10 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 		// state. See https://devblogs.microsoft.com/oldnewthing/20150304-00/?p=44543.
 		// Note that trying to do the adjustment in WM_GETMINMAXINFO is ignored by Windows.
 		szp := (*windows.NCCalcSizeParams)(unsafe.Pointer(lParam))
-		mi := windows.GetMonitorInfo(w.hwnd)
+		mi, ok := windows.GetMonitorInfo(szp.Rgrc[0], windows.MONITOR_DEFAULTTONULL)
+		if !ok {
+			return 0
+		}
 		szp.Rgrc[0] = mi.WorkArea
 		return 0
 	case windows.WM_PAINT:
@@ -407,11 +443,7 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 			return windows.TRUE
 		}
 		defer windows.ImmReleaseContext(w.hwnd, imc)
-		sel := w.w.EditorState().Selection
-		caret := sel.Transform.Transform(sel.Caret.Pos.Add(f32.Pt(0, sel.Caret.Descent)))
-		icaret := image.Pt(int(caret.X+.5), int(caret.Y+.5))
-		windows.ImmSetCompositionWindow(imc, icaret.X, icaret.Y)
-		windows.ImmSetCandidateWindow(imc, icaret.X, icaret.Y)
+		w.updateIMEWindows(imc)
 		return windows.TRUE
 	case windows.WM_IME_COMPOSITION:
 		imc := windows.ImmGetContext(w.hwnd)
@@ -419,39 +451,63 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 			return windows.TRUE
 		}
 		defer windows.ImmReleaseContext(w.hwnd, imc)
+		defer w.updateIMEWindows(imc)
 		state := w.w.EditorState()
-		rng := state.compose
-		if rng.Start == -1 {
-			rng = state.Selection.Range
+		if lParam&windows.GCS_RESULTSTR != 0 {
+			// RESULTSTR is committed text. Keep it separate from COMPSTR so a
+			// preedit update never looks like a commit.
+			rng := imeRange(state)
+			result := windows.ImmGetCompositionString(imc, windows.GCS_RESULTSTR)
+			start := rng.Start
+			w.w.EditorReplace(rng, result)
+			end := start + utf8.RuneCountInString(result)
+			w.w.SetComposingRegion(key.Range{Start: -1, End: -1})
+			w.w.SetEditorSelection(key.Range{Start: end, End: end})
+			if lParam&windows.GCS_COMPSTR == 0 {
+				return windows.TRUE
+			}
+			state = w.w.EditorState()
 		}
-		if rng.Start > rng.End {
-			rng.Start, rng.End = rng.End, rng.Start
+		if lParam&windows.GCS_COMPSTR != 0 {
+			// COMPSTR is still preedit text, so keep the composing range alive.
+			rng := imeRange(state)
+			replacement := windows.ImmGetCompositionString(imc, windows.GCS_COMPSTR)
+			end := rng.Start + utf8.RuneCountInString(replacement)
+			w.w.EditorReplace(rng, replacement)
+			state = w.w.EditorState()
+			comp := key.Range{
+				Start: rng.Start,
+				End:   end,
+			}
+			if lParam&windows.GCS_DELTASTART != 0 {
+				start := windows.ImmGetCompositionValue(imc, windows.GCS_DELTASTART)
+				comp.Start = state.RunesIndex(state.UTF16Index(comp.Start) + start)
+			}
+			w.w.SetComposingRegion(comp)
+			pos := end
+			if lParam&windows.GCS_CURSORPOS != 0 {
+				rel := windows.ImmGetCompositionValue(imc, windows.GCS_CURSORPOS)
+				pos = state.RunesIndex(state.UTF16Index(rng.Start) + rel)
+			}
+			w.w.SetEditorSelection(key.Range{Start: pos, End: pos})
+			return windows.TRUE
 		}
-		var replacement string
-		switch {
-		case lParam&windows.GCS_RESULTSTR != 0:
-			replacement = windows.ImmGetCompositionString(imc, windows.GCS_RESULTSTR)
-		case lParam&windows.GCS_COMPSTR != 0:
-			replacement = windows.ImmGetCompositionString(imc, windows.GCS_COMPSTR)
+		if lParam&(windows.GCS_DELTASTART|windows.GCS_CURSORPOS) == 0 || state.compose.Start == -1 {
+			return windows.TRUE
 		}
-		end := rng.Start + utf8.RuneCountInString(replacement)
-		w.w.EditorReplace(rng, replacement)
-		state = w.w.EditorState()
-		comp := key.Range{
-			Start: rng.Start,
-			End:   end,
-		}
+		// Some composition messages only move the IME cursor or clause start.
+		rng := normRange(state.compose)
+		comp := rng
 		if lParam&windows.GCS_DELTASTART != 0 {
 			start := windows.ImmGetCompositionValue(imc, windows.GCS_DELTASTART)
 			comp.Start = state.RunesIndex(state.UTF16Index(comp.Start) + start)
+			w.w.SetComposingRegion(comp)
 		}
-		w.w.SetComposingRegion(comp)
-		pos := end
 		if lParam&windows.GCS_CURSORPOS != 0 {
 			rel := windows.ImmGetCompositionValue(imc, windows.GCS_CURSORPOS)
-			pos = state.RunesIndex(state.UTF16Index(rng.Start) + rel)
+			pos := state.RunesIndex(state.UTF16Index(rng.Start) + rel)
+			w.w.SetEditorSelection(key.Range{Start: pos, End: pos})
 		}
-		w.w.SetEditorSelection(key.Range{Start: pos, End: pos})
 		return windows.TRUE
 	case windows.WM_IME_ENDCOMPOSITION:
 		w.w.SetComposingRegion(key.Range{Start: -1, End: -1})
@@ -475,21 +531,83 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 	return windows.DefWindowProc(hwnd, msg, wParam, lParam)
 }
 
+// getModifiers reports the currently pressed modifier keys.
+// GetKeyState uses the high-order bit for the pressed state:
+// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate
 func getModifiers() key.Modifiers {
 	var kmods key.Modifiers
-	if windows.GetKeyState(windows.VK_LWIN)&0x1000 != 0 || windows.GetKeyState(windows.VK_RWIN)&0x1000 != 0 {
+	if windows.GetKeyState(windows.VK_LWIN) < 0 || windows.GetKeyState(windows.VK_RWIN) < 0 {
 		kmods |= key.ModSuper
 	}
-	if windows.GetKeyState(windows.VK_MENU)&0x1000 != 0 {
+	if windows.GetKeyState(windows.VK_MENU) < 0 {
 		kmods |= key.ModAlt
 	}
-	if windows.GetKeyState(windows.VK_CONTROL)&0x1000 != 0 {
+	if windows.GetKeyState(windows.VK_CONTROL) < 0 {
 		kmods |= key.ModCtrl
 	}
-	if windows.GetKeyState(windows.VK_SHIFT)&0x1000 != 0 {
+	if windows.GetKeyState(windows.VK_SHIFT) < 0 {
 		kmods |= key.ModShift
 	}
 	return kmods
+}
+
+// updateIMEWindows keeps the Windows IME popup near the text being edited.
+func (w *window) updateIMEWindows(imc syscall.Handle) {
+	sel := w.w.EditorState().Selection
+	top := sel.Transform.Transform(sel.Caret.Pos.Add(f32.Pt(0, -sel.Caret.Ascent)))
+	base := sel.Transform.Transform(sel.Caret.Pos)
+	bottom := sel.Transform.Transform(sel.Caret.Pos.Add(f32.Pt(0, sel.Caret.Descent)))
+
+	itop := image.Pt(int(top.X+.5), int(top.Y+.5))
+	ibase := image.Pt(int(base.X+.5), int(base.Y+.5))
+	ibottom := image.Pt(int(bottom.X+.5), int(bottom.Y+.5))
+	if ibottom.Y <= itop.Y {
+		ibottom.Y = itop.Y + 1
+	}
+	exclude := windows.Rect{
+		Left:   int32(ibase.X),
+		Top:    int32(itop.Y),
+		Right:  int32(ibase.X + 1),
+		Bottom: int32(ibottom.Y),
+	}
+	x, y := ibottom.X, ibottom.Y
+	if !sel.CompositionBounds.Empty() {
+		exclude = transformRect(sel.Transform, sel.CompositionBounds)
+		x = int(exclude.Left)
+		y = int(exclude.Bottom)
+	}
+	windows.ImmSetCompositionWindow(imc, x, y)
+	windows.ImmSetCandidateWindow(imc, x, y, exclude)
+}
+
+// transformRect maps a local rectangle to window coordinates. Transform all
+// corners because an affine transform may flip or rotate the rectangle.
+func transformRect(t f32.Affine2D, r image.Rectangle) windows.Rect {
+	p0 := t.Transform(f32.Pt(float32(r.Min.X), float32(r.Min.Y)))
+	p1 := t.Transform(f32.Pt(float32(r.Max.X), float32(r.Min.Y)))
+	p2 := t.Transform(f32.Pt(float32(r.Max.X), float32(r.Max.Y)))
+	p3 := t.Transform(f32.Pt(float32(r.Min.X), float32(r.Max.Y)))
+
+	minX := min(min(p0.X, p1.X), min(p2.X, p3.X))
+	minY := min(min(p0.Y, p1.Y), min(p2.Y, p3.Y))
+	maxX := max(max(p0.X, p1.X), max(p2.X, p3.X))
+	maxY := max(max(p0.Y, p1.Y), max(p2.Y, p3.Y))
+	left := int32(math.Floor(float64(minX)))
+	top := int32(math.Floor(float64(minY)))
+	right := int32(math.Ceil(float64(maxX)))
+	bottom := int32(math.Ceil(float64(maxY)))
+	if right <= left {
+		right = left + 1
+	}
+	if bottom <= top {
+		bottom = top + 1
+	}
+	return windows.Rect{
+		Left:   left,
+		Top:    top,
+		Right:  right,
+		Bottom: bottom,
+	}
 }
 
 // hitTest returns the non-client area hit by the point, needed to
@@ -625,7 +743,12 @@ func (w *window) EditorStateChanged(old, new editorState) {
 		return
 	}
 	defer windows.ImmReleaseContext(w.hwnd, imc)
-	if old.Selection.Range != new.Selection.Range || old.Snippet != new.Snippet {
+	if old.Selection.Caret != new.Selection.Caret ||
+		old.Selection.Transform != new.Selection.Transform ||
+		old.Selection.CompositionBounds != new.Selection.CompositionBounds {
+		w.updateIMEWindows(imc)
+	}
+	if shouldCancelComposition(old, new) {
 		windows.ImmNotifyIME(imc, windows.NI_COMPOSITIONSTR, windows.CPS_CANCEL, 0)
 	}
 }
@@ -734,7 +857,7 @@ func (w *window) processDataEvent(content string) {
 }
 
 func (w *window) Configure(options []Option) {
-	dpi := windows.GetSystemDPI()
+	dpi := windows.GetWindowDPI(w.hwnd)
 	metric := configForDPI(dpi)
 	cnf := w.config
 	cnf.apply(metric, options)
@@ -800,10 +923,13 @@ func (w *window) Configure(options []Option) {
 		showMode = windows.SW_SHOWMAXIMIZED
 	}
 
-	// Disable window resizing if MinSize and MaxSize are equal.
-	if cnf.MaxSize != (image.Point{}) && cnf.MinSize == cnf.MaxSize {
+	// Disable the maximize button if MaxSize is set.
+	if cnf.MaxSize != (image.Point{}) {
 		style &^= windows.WS_MAXIMIZEBOX
-		style &^= windows.WS_THICKFRAME
+		// Disable window resizing if MinSize and MaxSize are equal.
+		if cnf.MinSize == cnf.MaxSize {
+			style &^= windows.WS_THICKFRAME
+		}
 	}
 
 	// Note: these invocation all trigger the windows callback method which may process a pending system.ActionCenter
@@ -923,10 +1049,14 @@ func (w *window) Perform(acts system.Action) {
 			r := windows.GetWindowRect(w.hwnd)
 			dx := r.Right - r.Left
 			dy := r.Bottom - r.Top
-			// Calculate center position on current monitor.
-			mi := windows.GetMonitorInfo(w.hwnd).Monitor
-			x := (mi.Right - mi.Left - dx) / 2
-			y := (mi.Bottom - mi.Top - dy) / 2
+			// Center in the usable area of the current monitor.
+			mi, ok := windows.GetMonitorInfo(r, windows.MONITOR_DEFAULTTONULL)
+			if !ok {
+				break
+			}
+			area := mi.WorkArea
+			x := (area.Right + area.Left - dx) / 2
+			y := (area.Bottom + area.Top - dy) / 2
 			windows.SetWindowPos(w.hwnd, 0, x, y, dx, dy, windows.SWP_NOZORDER|windows.SWP_FRAMECHANGED)
 		case system.ActionRaise:
 			// A minimized window has to be restored before it can be
@@ -949,9 +1079,22 @@ func convertKeyCode(code uintptr) (key.Name, bool) {
 	if '0' <= code && code <= '9' || 'A' <= code && code <= 'Z' {
 		return key.Name(rune(code)), true
 	}
+	if windows.VK_NUMPAD0 <= code && code <= windows.VK_NUMPAD9 {
+		return key.Name('0' + rune(code-windows.VK_NUMPAD0)), true
+	}
 	var r key.Name
 
 	switch code {
+	case windows.VK_ADD:
+		r = "+"
+	case windows.VK_SUBTRACT:
+		r = "-"
+	case windows.VK_MULTIPLY:
+		r = "*"
+	case windows.VK_DIVIDE:
+		r = "/"
+	case windows.VK_DECIMAL:
+		r = "."
 	case windows.VK_ESCAPE:
 		r = key.NameEscape
 	case windows.VK_LEFT:
